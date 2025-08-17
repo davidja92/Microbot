@@ -1,6 +1,7 @@
 package net.runelite.client.plugins.microbot.lizardtrapper;
 
 import net.runelite.api.GameObject;
+import net.runelite.api.Player;
 import net.runelite.api.Skill;
 import net.runelite.api.coords.WorldPoint;
 
@@ -24,23 +25,46 @@ import java.util.concurrent.TimeUnit;
 
 public class LizardTrapperScript extends Script
 {
+    // Trap object IDs
     private static final int FULL_TRAP_ID  = 9004;
     private static final int EMPTY_TRAP_ID = 9341;
 
+    // Items
     private static final String ROPE   = "Rope";
     private static final String NET    = "Small fishing net";
     private static final String LIZARD = "Swamp lizard";
-    private static final int REQUIRED_ROPES = 4;
-    private static final int REQUIRED_NETS  = 4;
 
+    // XP per catch (adjust if your server differs)
+    private static final int CATCH_XP_DEFAULT = 34;
+
+    // Trap tiles (priority order for placement)
     private static final WorldPoint NORTH      = new WorldPoint(3536, 3451, 0);
     private static final WorldPoint SOUTH      = new WorldPoint(3538, 3445, 0);
     private static final WorldPoint NORTHEAST  = new WorldPoint(3532, 3446, 0);
     private static final WorldPoint SOUTHWEST  = new WorldPoint(3549, 3449, 0);
+
+    // Start/return tile (anchor)
     private static final WorldPoint START_TILE = NORTH;
 
+    // Placement waiting thresholds
+    private static final int MIN_SETTLE_MS       = 1400; // minimum idle after a placement click
+    private static final int MAX_PLACE_WAIT_MS   = 6000; // after this, retry the click
+    private static final int PLACE_RETRY_LIMIT   = 3;    // avoid infinite loops
+
+    // Contest detection
+    private static final int CONTEST_RADIUS_TILES = 1;   // another player within 1 tile of a trap tile
+    private static final int POST_HOP_WAIT_MS     = 2000;
+
+    // State & tracking
     private volatile boolean positionedAtStart = false;
+    private volatile boolean bankingMode = false;       // persist through bank+return
+    private volatile boolean bankingSkipRestock = false; // NEW: don't restock if traps are deployed when entering bank
     private volatile String status = "Idle";
+
+    // "Pending placement" guard
+    private volatile WorldPoint pendingPlace = null;
+    private volatile long pendingStartAt = 0L;
+    private volatile int pendingRetries = 0;
 
     private long startMillis = 0L;
     private int startXp = 0;
@@ -50,6 +74,7 @@ public class LizardTrapperScript extends Script
     private Integer gePriceCache = null;
     private long gePriceCachedAt = 0L;
 
+    // Loot params (recover rope/net if dropped)
     private final LootingParameters lootParams = new LootingParameters(
             10, 1, 1, 1, false, true,
             "Rope,Small fishing net".split(",")
@@ -68,6 +93,18 @@ public class LizardTrapperScript extends Script
     public long getXpPerHour() {
         long elapsedMs = Math.max(1L, System.currentTimeMillis() - startMillis);
         return (long)(getXpGained() / (elapsedMs / 3600000.0));
+    }
+    public int getXpToNextLevel() {
+        int curLvl = getHunterLevelSafe();
+        if (curLvl >= 99) return 0;
+        int curXp  = getHunterXpSafe();
+        int nextXp = xpForLevel(curLvl + 1);
+        return Math.max(0, nextXp - curXp);
+    }
+    public int getActionsToNextLevel() {
+        int xpEach = Math.max(1, CATCH_XP_DEFAULT);
+        int xpLeft = getXpToNextLevel();
+        return (int)Math.ceil(xpLeft / (double)xpEach);
     }
     public Integer getGePriceSwampLizard() {
         if (gePriceCache != null && System.currentTimeMillis() - gePriceCachedAt < 5 * 60_000) return gePriceCache;
@@ -103,48 +140,130 @@ public class LizardTrapperScript extends Script
         startXp = getHunterXpSafe();
         totalLizBanked = 0L;
         positionedAtStart = false;
+        bankingMode = false;
+        bankingSkipRestock = false;
         status = "Booting";
+        clearPending();
 
         mainScheduledFuture = scheduledExecutorService.scheduleWithFixedDelay(() -> {
             try {
                 if (!Microbot.isLoggedIn()) return;
                 if (!super.run()) return;
 
-                // 1) Startup: ensure supplies, then go to start tile
-                if (config.autowalkOnEnable() && !positionedAtStart) {
-                    status = "Ensuring supplies…";
-                    if (!ensureSupplies()) return;
+                final int hunterLvl = getHunterLevelSafe();
+                final int trapLimit = trapLimitFromLevel(hunterLvl);
 
-                    WorldPoint me = Rs2Player.getWorldLocation();
-                    if (me == null || me.distanceTo(START_TILE) > 1) {
-                        status = "Walking to start…";
-                        Rs2Walker.walkTo(START_TILE);
-                        return;
-                    } else {
-                        positionedAtStart = true;
+                WorldPoint me = Rs2Player.getWorldLocation();
+
+                // If we're in bankingMode, keep banking & returning until we're back at start (don't place/check during this)
+                if (bankingMode) {
+                    // Exit banking mode only once we've reached START_TILE and inventory is not full
+                    if (me != null && me.distanceTo(START_TILE) <= 1 && !Rs2Inventory.isFull()) {
+                        bankingMode = false;
+                        positionedAtStart = true; // anchor again
                         status = "Ready";
+                    } else {
+                        status = "Banking…";
+                        bankLizAndReturn(config, trapLimit, bankingSkipRestock);
+                        return;
                     }
                 }
 
-                // 2) If full, bank ONLY lizards
+                // Start only if we have mats for trapLimit
+                if (!positionedAtStart) {
+                    if (me != null && me.distanceTo(START_TILE) <= 1 && hasMaterialsForTrapLimit(trapLimit)) {
+                        positionedAtStart = true;
+                        status = "Ready";
+                    } else if (config.autowalkOnEnable() && hasMaterialsForTrapLimit(trapLimit)) {
+                        status = "Walking to start…";
+                        Rs2Walker.walkTo(START_TILE);
+                        return;
+                    } else if (config.autowalkOnEnable()) {
+                        status = "Ensuring supplies…";
+                        if (!ensureSupplies(trapLimit)) return;
+                        if (me == null || me.distanceTo(START_TILE) > 1) {
+                            status = "Walking to start…";
+                            Rs2Walker.walkTo(START_TILE);
+                            return;
+                        } else {
+                            positionedAtStart = true;
+                            status = "Ready";
+                        }
+                    } else {
+                        status = "Waiting for player at start…";
+                        return;
+                    }
+                }
+
+                // If inv full, enter persistent banking mode (ignore trap collapses etc.)
                 if (Rs2Inventory.isFull() && Rs2Inventory.hasItem(LIZARD)) {
+                    // NEW: compute whether traps are deployed NOW; if so, skip restock from bank
+                    List<WorldPoint> targetsNow = orderedEnabledTraps(config, trapLimit);
+                    bankingSkipRestock = hasDeployedTraps(targetsNow);
+                    bankingMode = true;
                     status = "Banking lizards…";
-                    bankLizAndReturn();
+                    // Clear any pending placement (collapsed traps won't interrupt banking)
+                    clearPending();
+                    bankLizAndReturn(config, trapLimit, bankingSkipRestock);
                     return;
                 }
 
-                // 3) PRIORITY PHASE A: PLACE ALL TRAPS FIRST (maximize uptime/xp)
-                List<WorldPoint> targets = orderedEnabledTraps(config);
-                for (WorldPoint tile : targets) {
-                    if (placeIfEmpty(tile)) return; // issued an action; let the next tick continue
+                // Contest check (only if not banking)
+                List<WorldPoint> targetsNow = orderedEnabledTraps(config, trapLimit);
+                if (isContested(targetsNow, CONTEST_RADIUS_TILES)) {
+                    status = "Contested: dismantling & hopping…";
+                    handleContested(targetsNow, trapLimit);
+                    return;
                 }
 
-                // 4) PHASE B: after all set, sweep to CHECK any full traps
-                for (WorldPoint tile : targets) {
-                    if (checkIfFull(tile)) return; // issued an action; next tick
+                // Pending placement guard
+                if (pendingPlace != null) {
+                    if (Rs2Player.isWalking() || Rs2Player.isInteracting()) {
+                        status = "Waiting for placement animation…";
+                        return;
+                    }
+
+                    long elapsed = System.currentTimeMillis() - pendingStartAt;
+                    GameObject obj = Rs2GameObject.getGameObject(pendingPlace);
+                    int id = (obj != null) ? obj.getId() : 0;
+
+                    if (elapsed < MIN_SETTLE_MS) {
+                        status = "Settling…";
+                        return;
+                    }
+
+                    if (id != EMPTY_TRAP_ID && id != 0) {
+                        clearPending(); // success
+                        jitter(150, 250);
+                    } else if (elapsed >= MAX_PLACE_WAIT_MS) {
+                        if (pendingRetries < PLACE_RETRY_LIMIT && hasMaterialsForOneTrap()) {
+                            status = "Retrying placement @ " + pendingPlace + "…";
+                            if (!safeInteract(pendingPlace, "Set-trap")) {
+                                Rs2Walker.walkTo(pendingPlace);
+                            }
+                            pendingStartAt = System.currentTimeMillis();
+                            pendingRetries++;
+                        } else {
+                            status = "Placement timed out, moving on…";
+                            clearPending();
+                        }
+                    } else {
+                        status = "Waiting for trap to appear…";
+                    }
+                    return;
                 }
 
-                // 5) Loot nets/ropes if dropped (recovery)
+                // PHASE A: place traps up to limit (don’t start new one if pending)
+                for (WorldPoint tile : targetsNow) {
+                    if (attemptPlace(tile)) return; // started a placement; next tick confirms
+                }
+
+                // PHASE B: check any full traps
+                for (WorldPoint tile : targetsNow) {
+                    if (checkIfFull(tile)) return;
+                }
+
+                // Recovery: loot rope/net if dropped
                 if (!Rs2Player.isWalking() && !Rs2Player.isInteracting()) {
                     Rs2GroundItem.lootItemsBasedOnNames(lootParams);
                 }
@@ -159,35 +278,110 @@ public class LizardTrapperScript extends Script
         return true;
     }
 
+    // ===== Contest handling =====
+
+    private boolean isContested(List<WorldPoint> traps, int radius) {
+        try {
+            Player me = Microbot.getClient().getLocalPlayer();
+            List<Player> players = Microbot.getClient().getPlayers();
+            if (players == null) return false;
+
+            for (Player p : players) {
+                if (p == null || p == me) continue;
+                WorldPoint pw = p.getWorldLocation();
+                if (pw == null) continue;
+
+                for (WorldPoint t : traps) {
+                    if (pw.distanceTo(t) <= radius) {
+                        return true;
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
+        return false;
+    }
+
+    /** Dismantle our traps, loot rope/net, and world hop (members world). */
+    private void handleContested(List<WorldPoint> traps, int trapLimit) {
+        try {
+            // Cancel any pending placement
+            clearPending();
+
+            // Dismantle any trap objects we can at our tiles
+            for (WorldPoint t : traps) {
+                GameObject obj = Rs2GameObject.getGameObject(t);
+                if (obj == null) continue;
+                int id = obj.getId();
+                if (id == EMPTY_TRAP_ID || id == FULL_TRAP_ID) {
+                    status = "Dismantling @ " + t;
+                    if (!safeInteract(t, "Dismantle")) {
+                        Rs2Walker.walkTo(t);
+                        safeInteract(t, "Dismantle");
+                    }
+                    jitter(250, 400);
+                }
+            }
+
+            // Loot back rope/net if they pop to the ground
+            Rs2GroundItem.lootItemsBasedOnNames(lootParams);
+            jitter(150, 250);
+
+            // Hop to a different members world
+            status = "World hopping (members)…";
+            hopToRandomMembersCompat();
+            jitter(POST_HOP_WAIT_MS, POST_HOP_WAIT_MS + 500);
+
+            // After hop, we’ll re-check supplies and walk to start next loop
+            positionedAtStart = false;
+
+        } catch (Throwable t) {
+            Microbot.log("Contest handler error: " + t.getMessage());
+        }
+    }
+
     // ===== Trap helpers =====
 
-    /** Build the enabled trap list in the order we want to place them. */
-    private List<WorldPoint> orderedEnabledTraps(LizardTrapperConfig cfg) {
+    private List<WorldPoint> orderedEnabledTraps(LizardTrapperConfig cfg, int trapLimit) {
         List<WorldPoint> list = new ArrayList<>(4);
         if (cfg.useNorth())     list.add(NORTH);
         if (cfg.useSouth())     list.add(SOUTH);
         if (cfg.useNorthEast()) list.add(NORTHEAST);
         if (cfg.useSouthWest()) list.add(SOUTHWEST);
+        if (list.size() > trapLimit) list = new ArrayList<>(list.subList(0, trapLimit));
         return list;
     }
 
-    /** If a tile is empty and we have supplies, walk there (if needed) and set the trap. */
-    private boolean placeIfEmpty(WorldPoint tile) {
+    /** Are there any traps currently deployed (tile not EMPTY)? */
+    private boolean hasDeployedTraps(List<WorldPoint> traps) {
+        for (WorldPoint t : traps) {
+            GameObject obj = Rs2GameObject.getGameObject(t);
+            int id = (obj != null) ? obj.getId() : 0;
+            if (id != 0 && id != EMPTY_TRAP_ID) {
+                return true; // includes FULL_TRAP_ID or any set-trap object id
+            }
+        }
+        return false;
+    }
+
+    /** Begin a placement if tile is currently EMPTY and we have mats; sets pending state and idles until it's actually placed. */
+    private boolean attemptPlace(WorldPoint tile) {
         GameObject trap = Rs2GameObject.getGameObject(tile);
         int id = (trap != null) ? trap.getId() : 0;
 
-        if (id == EMPTY_TRAP_ID && hasSuppliesInInv()) {
+        if (id == EMPTY_TRAP_ID && hasMaterialsForOneTrap()) {
             status = "Placing trap @ " + tile;
-            // If the object isn't interactable from here, step to the tile first
             if (!safeInteract(tile, "Set-trap")) {
                 Rs2Walker.walkTo(tile);
             }
+            pendingPlace = tile;
+            pendingStartAt = System.currentTimeMillis();
+            pendingRetries = 0;
+            jitter(250, 400);
             return true;
         }
         return false;
     }
 
-    /** If a tile has a full trap, walk/offset click and check it. */
     private boolean checkIfFull(WorldPoint tile) {
         GameObject trap = Rs2GameObject.getGameObject(tile);
         int id = (trap != null) ? trap.getId() : 0;
@@ -195,28 +389,32 @@ public class LizardTrapperScript extends Script
         if (id == FULL_TRAP_ID) {
             status = "Checking trap @ " + tile;
             WorldPoint clickPoint = tile;
-            // tiny offset only for SOUTH to avoid self-clicks (as before)
             if (tile.equals(SOUTH)) clickPoint = new WorldPoint(3537, 3445, 0);
 
             if (!safeInteract(clickPoint, "Check")) {
                 Rs2Walker.walkTo(clickPoint);
             }
+            jitter(150, 250);
             return true;
         }
         return false;
     }
 
-    /** Try interacting directly; returns true if we *attempted* an interact (even if your API doesn't give a success flag). */
     private boolean safeInteract(WorldPoint tile, String action) {
         try { Rs2GameObject.interact(tile, action); return true; }
         catch (Throwable t) { return false; }
     }
 
-    // ===== Supplies / Banking =====
+    private void clearPending() {
+        pendingPlace = null;
+        pendingStartAt = 0L;
+        pendingRetries = 0;
+    }
 
-    private boolean ensureSupplies()
+    // ===== Supplies / Banking =====
+    private boolean ensureSupplies(int trapLimit)
     {
-        if (hasSuppliesInInv()) return true;
+        if (hasMaterialsForTrapLimit(trapLimit)) return true;
 
         if (!Rs2Bank.isOpen()) {
             Rs2Bank.walkToBank();
@@ -227,17 +425,19 @@ public class LizardTrapperScript extends Script
         depositAllCompat();
         jitter(150, 250);
 
-        int needRopes = Math.max(0, REQUIRED_ROPES - getAmount(ROPE));
-        int needNets  = Math.max(0, REQUIRED_NETS  - getAmount(NET));
+        // Top up to trapLimit (1 rope + 1 net per trap)
+        int needRopes = Math.max(0, trapLimit - getAmount(ROPE));
+        int needNets  = Math.max(0, trapLimit - getAmount(NET));
 
         withdrawAmountCompat(ROPE, needRopes);
         withdrawAmountCompat(NET,  needNets);
 
         Rs2Bank.closeBank();
-        return hasSuppliesInInv();
+        return hasMaterialsForTrapLimit(trapLimit);
     }
 
-    private void bankLizAndReturn()
+    /** Banking that optionally skips restocking if traps are currently deployed. */
+    private void bankLizAndReturn(LizardTrapperConfig cfg, int trapLimit, boolean skipRestock)
     {
         if (!Rs2Bank.isOpen()) {
             Rs2Bank.walkToBank();
@@ -251,21 +451,64 @@ public class LizardTrapperScript extends Script
         if (!deposited) {
             depositAllCompat();
             jitter(150, 250);
-            withdrawAmountCompat(ROPE, Math.max(0, REQUIRED_ROPES - getAmount(ROPE)));
-            withdrawAmountCompat(NET,  Math.max(0, REQUIRED_NETS  - getAmount(NET)));
         }
 
         if (lizInInv > 0) totalLizBanked += lizInInv;
+
+        // Only restock if requested AND we actually need mats
+        if (!skipRestock) {
+            int needRopes = Math.max(0, trapLimit - getAmount(ROPE));
+            int needNets  = Math.max(0, trapLimit - getAmount(NET));
+            if (needRopes > 0) withdrawAmountCompat(ROPE, needRopes);
+            if (needNets  > 0) withdrawAmountCompat(NET,  needNets);
+        }
 
         Rs2Bank.closeBank();
         Rs2Walker.walkTo(START_TILE);
     }
 
-    private boolean hasSuppliesInInv()
-    {
-        return getAmount(ROPE) >= REQUIRED_ROPES && getAmount(NET) >= REQUIRED_NETS;
+    private boolean hasMaterialsForOneTrap() {
+        return getAmount(ROPE) >= 1 && getAmount(NET) >= 1;
+    }
+    private boolean hasMaterialsForTrapLimit(int trapLimit) {
+        return getAmount(ROPE) >= trapLimit && getAmount(NET) >= trapLimit;
     }
 
+    // ===== Level / XP helpers =====
+    private int trapLimitFromLevel(int lvl) {
+        if (lvl >= 60) return 4;
+        if (lvl >= 40) return 3;
+        if (lvl >= 20) return 2;
+        return 1;
+    }
+
+    /** RuneScape XP curve (levels 1..99). */
+    private int xpForLevel(int level) {
+        if (level <= 1) return 0;
+        if (level > 99) level = 99;
+        double points = 0.0;
+        for (int lvl = 1; lvl < level; lvl++) {
+            points += Math.floor(lvl + 300.0 * Math.pow(2.0, lvl / 7.0));
+        }
+        return (int)Math.floor(points / 4.0);
+    }
+
+    private int getHunterLevelSafe()
+    {
+        try { return Microbot.getClient().getRealSkillLevel(Skill.HUNTER); }
+        catch (Throwable t) {
+            try { return Microbot.getClient().getBoostedSkillLevel(Skill.HUNTER); }
+            catch (Throwable t2) { return 1; }
+        }
+    }
+
+    private int getHunterXpSafe()
+    {
+        try { return Microbot.getClient().getSkillExperience(Skill.HUNTER); }
+        catch (Throwable t) { return 0; }
+    }
+
+    // ===== Inventory counting with broad compatibility =====
     private int getAmount(String name)
     {
         // Try common direct counters first
@@ -320,10 +563,27 @@ public class LizardTrapperScript extends Script
         return 0;
     }
 
-    private int getHunterXpSafe()
-    {
-        try { return Microbot.getClient().getSkillExperience(Skill.HUNTER); }
-        catch (Throwable t) { return 0; }
+    // ===== World hop (compat via reflection) =====
+    private void hopToRandomMembersCompat() {
+        String[] classes = new String[] {
+                "net.runelite.client.plugins.microbot.util.worldhopper.Rs2WorldHopper",
+                "net.runelite.client.plugins.microbot.util.world.Rs2WorldHopper",
+                "net.runelite.client.plugins.microbot.util.worlds.Rs2WorldHopper"
+        };
+        for (String cls : classes) {
+            try {
+                Class<?> c = Class.forName(cls);
+                // no-arg methods first
+                for (String m : new String[]{"hopToRandomMembers", "hopToRandomP2P"}) {
+                    try { c.getMethod(m).invoke(null); return; } catch (Throwable ignored) {}
+                }
+                // boolean-arg methods
+                for (String m : new String[]{"hopToRandomWorld", "hopToRandom"}) {
+                    try { c.getMethod(m, boolean.class).invoke(null, true); return; } catch (Throwable ignored) {}
+                }
+            } catch (Throwable ignoredOuter) {}
+        }
+        Microbot.log("World hop compat: could not find a hopper method.");
     }
 
     // ===== Bank compatibility helpers =====
@@ -381,11 +641,14 @@ public class LizardTrapperScript extends Script
         try { Thread.sleep(d); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
     }
 
+    // ===== Misc =====
     @Override
     public void shutdown()
     {
         super.shutdown();
         positionedAtStart = false;
+        bankingMode = false;
+        bankingSkipRestock = false;
         status = "Idle";
     }
 }

@@ -34,7 +34,6 @@ public class LizardTrapperOverlay extends Overlay
             return null;
 
         panel.getChildren().clear();
-
         final NumberFormat nf = NumberFormat.getInstance();
 
         panel.getChildren().add(TitleComponent.builder()
@@ -67,12 +66,10 @@ public class LizardTrapperOverlay extends Overlay
                 .left("Lizards Banked")
                 .right(Long.toString(script.getTotalLizBanked()))
                 .build());
-
         panel.getChildren().add(LineComponent.builder()
                 .left("Profit (Config)")
                 .right(nf.format(script.getTotalProfit(config.pricePerLizard())))
                 .build());
-
         panel.getChildren().add(LineComponent.builder()
                 .left("Profit (GE)")
                 .right(gePrice == null ? "n/a" : nf.format(script.getTotalProfit(gePrice)))
@@ -86,6 +83,16 @@ public class LizardTrapperOverlay extends Overlay
         panel.getChildren().add(LineComponent.builder()
                 .left("XP / hr")
                 .right(nf.format(script.getXpPerHour()))
+                .build());
+
+        // New: progression to next level
+        panel.getChildren().add(LineComponent.builder()
+                .left("XP to level")
+                .right(nf.format(script.getXpToNextLevel()))
+                .build());
+        panel.getChildren().add(LineComponent.builder()
+                .left("Actions to level")
+                .right(nf.format(script.getActionsToNextLevel()))
                 .build());
 
         return panel.render(g);

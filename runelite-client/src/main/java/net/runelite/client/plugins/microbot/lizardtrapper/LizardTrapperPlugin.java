@@ -11,9 +11,9 @@ import net.runelite.client.plugins.microbot.Microbot;
 
 @PluginDescriptor(
         name = "Microbot - Lizard Trapper",
-        description = "Automates Swamp Lizard catching with banking, XP & profit tracking (shows GE price when available).",
+        description = "Automates Swamp Lizard catching with banking, XP & profit tracking.",
         tags = {"microbot","hunter","lizard","trap","automation"},
-        enabledByDefault = false
+        enabledByDefault = false   // <-- disabled at client start; user must enable first
 )
 public class LizardTrapperPlugin extends Plugin
 {
@@ -21,6 +21,7 @@ public class LizardTrapperPlugin extends Plugin
     @Inject private OverlayManager overlayManager;
     @Inject private LizardTrapperOverlay overlay;
 
+    // Script instance shared with overlay
     private final LizardTrapperScript script = new LizardTrapperScript();
 
     @Provides
@@ -32,6 +33,7 @@ public class LizardTrapperPlugin extends Plugin
     @Override
     protected void startUp()
     {
+        // Runs ONLY when you enable the plugin in RuneLite
         overlay.setScript(script);
         overlay.setConfig(config);
         overlayManager.add(overlay);
