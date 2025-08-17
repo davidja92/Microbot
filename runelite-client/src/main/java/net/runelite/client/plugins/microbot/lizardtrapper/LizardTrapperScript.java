@@ -17,7 +17,8 @@ import net.runelite.client.plugins.microbot.util.walker.Rs2Walker;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Method;
-import java.util.Collection;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
@@ -45,7 +46,7 @@ public class LizardTrapperScript extends Script
     private int startXp = 0;
     private long totalLizBanked = 0L;
 
-    // GE price cache (avoid hammering)
+    // GE price cache (5 min)
     private Integer gePriceCache = null;
     private long gePriceCachedAt = 0L;
 
@@ -54,6 +55,7 @@ public class LizardTrapperScript extends Script
             "Rope,Small fishing net".split(",")
     );
 
+    // ===== Public getters used by overlay =====
     public String statusLine() { return status; }
     public long   getTotalLizBanked() { return totalLizBanked; }
     public String getFormattedUptime() {
@@ -67,65 +69,32 @@ public class LizardTrapperScript extends Script
         long elapsedMs = Math.max(1L, System.currentTimeMillis() - startMillis);
         return (long)(getXpGained() / (elapsedMs / 3600000.0));
     }
-
     public Integer getGePriceSwampLizard() {
-        // Return cached value for 5 minutes
-        if (gePriceCache != null && System.currentTimeMillis() - gePriceCachedAt < 5 * 60_000) {
-            return gePriceCache;
-        }
-
+        if (gePriceCache != null && System.currentTimeMillis() - gePriceCachedAt < 5 * 60_000) return gePriceCache;
         try {
-            // Resolve ItemID.SWAMP_LIZARD (via reflection for safety)
             Class<?> itemIdCls = Class.forName("net.runelite.api.ItemID");
             Field fld = itemIdCls.getField("SWAMP_LIZARD");
             int itemId = fld.getInt(null);
 
-            // Try Microbot.getItemManager()
             Object itemManager = null;
+            try { itemManager = Microbot.class.getMethod("getItemManager").invoke(null); } catch (Throwable ignored) {}
+            if (itemManager == null) { try { itemManager = Microbot.class.getField("itemManager").get(null); } catch (Throwable ignored) {} }
+            if (itemManager == null) return null;
+
             try {
-                Method getIM = Microbot.class.getMethod("getItemManager");
-                itemManager = getIM.invoke(null);
+                Object res = itemManager.getClass().getMethod("getItemPrice", int.class).invoke(itemManager, itemId);
+                if (res instanceof Integer) { gePriceCache = (Integer) res; gePriceCachedAt = System.currentTimeMillis(); return gePriceCache; }
             } catch (Throwable ignored) {}
-
-            // Fall back to a common static field name if present (rare)
-            if (itemManager == null) {
-                try {
-                    Field f = Microbot.class.getField("itemManager");
-                    itemManager = f.get(null);
-                } catch (Throwable ignored) {}
-            }
-
-            if (itemManager == null) return null; // cannot fetch
-
-            // Prefer synchronous getItemPrice(int)
             try {
-                Method getItemPrice = itemManager.getClass().getMethod("getItemPrice", int.class);
-                Object res = getItemPrice.invoke(itemManager, itemId);
-                if (res instanceof Integer) {
-                    gePriceCache = (Integer) res;
-                    gePriceCachedAt = System.currentTimeMillis();
-                    return gePriceCache;
-                }
-            } catch (Throwable ignored) {}
-
-            // Some builds expose getItemPriceAsync(int) -> CompletableFuture<Integer>
-            try {
-                Method getAsync = itemManager.getClass().getMethod("getItemPriceAsync", int.class);
-                Object fut = getAsync.invoke(itemManager, itemId);
-                // Try simple get() without importing CF type
-                Method get = fut.getClass().getMethod("get");
-                Object res = get.invoke(fut);
-                if (res instanceof Integer) {
-                    gePriceCache = (Integer) res;
-                    gePriceCachedAt = System.currentTimeMillis();
-                    return gePriceCache;
-                }
+                Object fut = itemManager.getClass().getMethod("getItemPriceAsync", int.class).invoke(itemManager, itemId);
+                Object res = fut.getClass().getMethod("get").invoke(fut);
+                if (res instanceof Integer) { gePriceCache = (Integer) res; gePriceCachedAt = System.currentTimeMillis(); return gePriceCache; }
             } catch (Throwable ignored) {}
         } catch (Throwable ignoredOuter) {}
-
         return null;
     }
 
+    // ===== Main run loop =====
     public boolean run(LizardTrapperConfig config)
     {
         Microbot.enableAutoRunOn = false;
@@ -141,8 +110,8 @@ public class LizardTrapperScript extends Script
                 if (!Microbot.isLoggedIn()) return;
                 if (!super.run()) return;
 
-                if (config.autowalkOnEnable() && !positionedAtStart)
-                {
+                // 1) Startup: ensure supplies, then go to start tile
+                if (config.autowalkOnEnable() && !positionedAtStart) {
                     status = "Ensuring supplies…";
                     if (!ensureSupplies()) return;
 
@@ -157,20 +126,28 @@ public class LizardTrapperScript extends Script
                     }
                 }
 
+                // 2) If full, bank ONLY lizards
                 if (Rs2Inventory.isFull() && Rs2Inventory.hasItem(LIZARD)) {
                     status = "Banking lizards…";
                     bankLizAndReturn();
                     return;
                 }
 
-                if (config.useNorth())     handleTrap(NORTH, null);
-                if (config.useSouth())     handleTrap(SOUTH, new WorldPoint(3537, 3445, 0));
-                if (config.useNorthEast()) handleTrap(NORTHEAST, null);
-                if (config.useSouthWest()) handleTrap(SOUTHWEST, null);
+                // 3) PRIORITY PHASE A: PLACE ALL TRAPS FIRST (maximize uptime/xp)
+                List<WorldPoint> targets = orderedEnabledTraps(config);
+                for (WorldPoint tile : targets) {
+                    if (placeIfEmpty(tile)) return; // issued an action; let the next tick continue
+                }
 
-                if (Rs2Player.isWalking() || Rs2Player.isInteracting()) return;
+                // 4) PHASE B: after all set, sweep to CHECK any full traps
+                for (WorldPoint tile : targets) {
+                    if (checkIfFull(tile)) return; // issued an action; next tick
+                }
 
-                Rs2GroundItem.lootItemsBasedOnNames(lootParams);
+                // 5) Loot nets/ropes if dropped (recovery)
+                if (!Rs2Player.isWalking() && !Rs2Player.isInteracting()) {
+                    Rs2GroundItem.lootItemsBasedOnNames(lootParams);
+                }
 
                 status = "Looping";
 
@@ -182,23 +159,60 @@ public class LizardTrapperScript extends Script
         return true;
     }
 
-    private void handleTrap(WorldPoint tile, WorldPoint optionalCheckClick)
-    {
+    // ===== Trap helpers =====
+
+    /** Build the enabled trap list in the order we want to place them. */
+    private List<WorldPoint> orderedEnabledTraps(LizardTrapperConfig cfg) {
+        List<WorldPoint> list = new ArrayList<>(4);
+        if (cfg.useNorth())     list.add(NORTH);
+        if (cfg.useSouth())     list.add(SOUTH);
+        if (cfg.useNorthEast()) list.add(NORTHEAST);
+        if (cfg.useSouthWest()) list.add(SOUTHWEST);
+        return list;
+    }
+
+    /** If a tile is empty and we have supplies, walk there (if needed) and set the trap. */
+    private boolean placeIfEmpty(WorldPoint tile) {
+        GameObject trap = Rs2GameObject.getGameObject(tile);
+        int id = (trap != null) ? trap.getId() : 0;
+
+        if (id == EMPTY_TRAP_ID && hasSuppliesInInv()) {
+            status = "Placing trap @ " + tile;
+            // If the object isn't interactable from here, step to the tile first
+            if (!safeInteract(tile, "Set-trap")) {
+                Rs2Walker.walkTo(tile);
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /** If a tile has a full trap, walk/offset click and check it. */
+    private boolean checkIfFull(WorldPoint tile) {
         GameObject trap = Rs2GameObject.getGameObject(tile);
         int id = (trap != null) ? trap.getId() : 0;
 
         if (id == FULL_TRAP_ID) {
             status = "Checking trap @ " + tile;
-            if (optionalCheckClick != null) {
-                Rs2GameObject.interact(optionalCheckClick, "Check");
-            } else {
-                Rs2GameObject.interact(tile, "Check");
+            WorldPoint clickPoint = tile;
+            // tiny offset only for SOUTH to avoid self-clicks (as before)
+            if (tile.equals(SOUTH)) clickPoint = new WorldPoint(3537, 3445, 0);
+
+            if (!safeInteract(clickPoint, "Check")) {
+                Rs2Walker.walkTo(clickPoint);
             }
-        } else if (id == EMPTY_TRAP_ID && hasSuppliesInInv()) {
-            status = "Setting trap @ " + tile;
-            Rs2GameObject.interact(tile, "Set-trap");
+            return true;
         }
+        return false;
     }
+
+    /** Try interacting directly; returns true if we *attempted* an interact (even if your API doesn't give a success flag). */
+    private boolean safeInteract(WorldPoint tile, String action) {
+        try { Rs2GameObject.interact(tile, action); return true; }
+        catch (Throwable t) { return false; }
+    }
+
+    // ===== Supplies / Banking =====
 
     private boolean ensureSupplies()
     {
@@ -312,7 +326,7 @@ public class LizardTrapperScript extends Script
         catch (Throwable t) { return 0; }
     }
 
-    // ---- Bank compatibility helpers ----
+    // ===== Bank compatibility helpers =====
     private boolean depositAllCompat() {
         String[] candidates = {"depositAll", "depositInventory", "depositEverything"};
         for (String m : candidates) {
